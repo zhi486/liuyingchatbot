@@ -10,7 +10,7 @@
 > （建议替换为你自己的项目截图）
 
 ```md
-![Demo](./assets/demo.png)
+![Demo](/assets/demo.png)
 ```
 
 ---
