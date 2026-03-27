@@ -1,0 +1,30 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# 虚拟环境
+.venv/
+env/
+venv/
+
+# 本项目生成的文件
+histories/
+voices/
+*.mp3
+*.wav
+*.log
+.env
+
+# 模型文件（太大，不要上传）
+models/
+*.bin
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+
+# 临时文件
+temp/
