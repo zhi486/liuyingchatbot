@@ -1,0 +1,9 @@
+gradio>=4.0.0
+transformers>=4.36.0
+torch>=2.0.0
+pydub
+aip
+requests
+python-dotenv
+bitsandbytes
+accelerate
