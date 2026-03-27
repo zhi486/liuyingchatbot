@@ -36,6 +36,9 @@ temp/
 *_test.py
 voice_shift.py
 chatbot_gpu.py
+test_fish_audio.py
+test_model.py
+test_proxy.py
 
 # 旧版本
 web_chatbot.py
@@ -43,6 +46,3 @@ web_chatbot_voice.py
 web_chatbot_voice1.py
 web_chatbot_voice2.py
 web_chatbot_voice3.py
-test_fish_audio.py
-test_model.py
-test_proxy.py
