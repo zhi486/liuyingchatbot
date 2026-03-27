@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()  # 加载 .env 文件
 import gradio as gr
 import json
 import os
@@ -25,13 +27,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 os.environ['NO_PROXY'] = '*'
-ffmpeg_path = r"C:\ffmpeg-8.0.1-essentials_build\ffmpeg-8.0.1-essentials_build\bin"
-os.environ["PATH"] = ffmpeg_path + os.pathsep + os.environ.get("PATH", "")
+FFMPEG_PATH = os.getenv('FFMPEG_PATH')
+if FFMPEG_PATH:
+    os.environ["PATH"] = FFMPEG_PATH + os.pathsep + os.environ.get("PATH", "")
 
 # ================== 百度语音配置 ==================
-APP_ID = '122500176'
-API_KEY = 'GQxtKnx0bjVoKAg5rQdzWzkk'
-SECRET_KEY = 'pZGbVfhlUaYaGPn2tI7QpoIeZmbCPXca'
+APP_ID = os.getenv('BAIDU_APP_ID')
+API_KEY = os.getenv('BAIDU_API_KEY')
+SECRET_KEY = os.getenv('BAIDU_SECRET_KEY')
 baidu_client = AipSpeech(APP_ID, API_KEY, SECRET_KEY)
 
 def convert_audio_to_wav(input_path):
@@ -48,7 +51,7 @@ def convert_audio_to_wav(input_path):
         raise
 
 # ================== 模型配置 ==================
-MODEL_PATH = r"C:\Users\fangr\PycharmProjects\chatbot\localmodel\models\qwen\Qwen2-7B-Instruct"
+MODEL_PATH = os.getenv('MODEL_PATH', './models/Qwen2-7B-Instruct')
 quantization_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
@@ -194,9 +197,9 @@ def voice_to_text(audio_file):
         return f"错误: {e}"
 
 # ================== Fish Audio 配置 ==================
-FISH_API_KEY = "a6946744679e45a7b057f965769f33ca"
-LIUYING_REFERENCE_ID = "79b9954c15f24deeab2319ec5f44f3b0"
-PROXY_URL = "http://127.0.0.1:7890"
+FISH_API_KEY = os.getenv('FISH_API_KEY')
+LIUYING_REFERENCE_ID = os.getenv('LIUYING_REFERENCE_ID')
+PROXY_URL = os.getenv('PROXY_URL')
 _audio_cache = {}
 VOICES_DIR = Path(__file__).parent / "voices"
 VOICES_DIR.mkdir(exist_ok=True)
