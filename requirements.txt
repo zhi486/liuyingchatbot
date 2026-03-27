@@ -7,3 +7,6 @@ requests
 python-dotenv
 bitsandbytes
 accelerate
+ffmpeg-python
+httpx
+geopy
