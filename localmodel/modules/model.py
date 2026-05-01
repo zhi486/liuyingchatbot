@@ -4,52 +4,94 @@ import time
 import torch
 from threading import Thread, Lock
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer,
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
     TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList,
 )
-from accelerate import dispatch_model, infer_auto_device_map
 from modules.config import MODEL_PATH, logger
 
-# 防止 OpenMP DLL 冲突导致的崩溃
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
-# 模块级变量
 _tokenizer = None
 _model = None
 _load_lock = Lock()
 _stop_requested = False
+_using_quantization = False
 
 
 class _StopOnFlag(StoppingCriteria):
-    """当 _stop_requested 被设置时通知模型停止生成"""
     def __call__(self, input_ids, scores, **kwargs):
         return _stop_requested
 
 
 def request_stop():
-    """请求停止当前生成"""
     global _stop_requested
     _stop_requested = True
 
 
 def clear_stop_flag():
-    """清除停止标记（每次生成前调用）"""
     global _stop_requested
     _stop_requested = False
 
 
-def is_stop_requested() -> bool:
-    """检查是否收到停止请求"""
+def is_stop_requested():
     return _stop_requested
 
 
-def load_model():
-    """加载模型（线程安全，仅首次调用时执行）
+def _load_4bit_quantized():
+    """4-bit 量化加载到 GPU（需要 ~4.5GB 空闲显存）"""
+    global _tokenizer, _model, _using_quantization
+    _tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH, trust_remote_code=True, local_files_only=True,
+    )
+    quant = BitsAndBytesConfig(load_in_4bit=True)
+    _model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        device_map='auto',
+        quantization_config=quant,
+        attn_implementation='sdpa',
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+    )
+    _using_quantization = True
+    logger.info(f'4-bit 量化加载成功，显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB')
 
-    先用 CPU 加载（稳定），再通过 accelerate 手动将部分层分配到 GPU，
-    以绕过 device_map='auto' 和 bitsandbytes 在 Python 3.13 + Windows 上的崩溃问题。
-    """
-    global _tokenizer, _model
+
+def _load_hybrid():
+    """bfloat16 CPU 加载 + 将部分层分配到 GPU"""
+    global _tokenizer, _model, _using_quantization
+    _tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH, trust_remote_code=True, local_files_only=True,
+    )
+    _model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        device_map='cpu',
+        attn_implementation='sdpa',
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+    )
+    _using_quantization = False
+    if torch.cuda.is_available() and torch.cuda.mem_get_info()[0] > 2 * 1024**3:
+        from accelerate import dispatch_model, infer_auto_device_map
+        free_gpu, total_gpu = torch.cuda.mem_get_info()
+        try:
+            device_map = infer_auto_device_map(
+                _model,
+                max_memory={0: f'{int(min(free_gpu * 0.9, total_gpu * 0.85)/1024**3)}GiB',
+                            'cpu': '14GiB'},
+                no_split_module_classes=['Qwen2DecoderLayer'],
+            )
+            dispatch_model(_model, device_map=device_map)
+            gpu_n = sum(1 for v in device_map.values() if v == 0)
+            cpu_n = sum(1 for v in device_map.values() if v == 'cpu')
+            logger.info(f'模型分配: GPU {gpu_n} 模块 ({torch.cuda.memory_allocated()/1024**3:.1f}GB) + CPU {cpu_n} 模块')
+        except Exception as e:
+            logger.warning(f'GPU 分配失败，留在 CPU: {e}')
+
+
+def load_model():
+    global _tokenizer, _model, _using_quantization
     if _model is not None:
         return _model, _tokenizer
 
@@ -58,36 +100,39 @@ def load_model():
             return _model, _tokenizer
 
         logger.info('正在加载模型，请稍候...')
+        torch.cuda.empty_cache()
+
+        # 策略 1：4-bit 量化（最快，需要 ~4.5GB 空闲显存）
+        if torch.cuda.is_available():
+            free_gpu = torch.cuda.mem_get_info()[0]
+            total_gpu = torch.cuda.get_device_properties(0).total_memory
+            logger.info(f'GPU 空闲显存: {free_gpu/1024**3:.1f}GB / {total_gpu/1024**3:.1f}GB')
+            if free_gpu > 4.5 * 1024**3:
+                try:
+                    _load_4bit_quantized()
+                    logger.info(f'加载完成, Attention: {_model.config._attn_implementation}')
+                    return _model, _tokenizer
+                except Exception as e:
+                    logger.warning(f'4-bit 量化失败: {e}，回退中...')
+                    _tokenizer = None
+                    _model = None
+                    torch.cuda.empty_cache()
+            else:
+                logger.info(f'显存不足需 4.5GB 实际仅 {free_gpu/1024**3:.1f}GB，跳过量化')
+
+        # 策略 2：bfloat16 CPU + 部分 GPU offload
         try:
-            _tokenizer = AutoTokenizer.from_pretrained(
-                MODEL_PATH, trust_remote_code=True, local_files_only=True,
+            _load_hybrid()
+            logger.info(f'加载完成, Attention: {_model.config._attn_implementation}')
+        except OSError as e:
+            logger.error(
+                '内存不足，无法加载模型。请尝试：'
+                '1. 关闭 Edge/Chrome 浏览器和其他程序\n'
+                '2. 关闭 Wallpaper Engine 等后台程序\n'
+                '3. 重启电脑后直接运行\n'
+                f'错误: {e}'
             )
-            # 第 1 步：在 CPU 上加载（不使用 device_map='auto'，避免加速器崩溃）
-            _model = AutoModelForCausalLM.from_pretrained(
-                MODEL_PATH,
-                trust_remote_code=True,
-                device_map='cpu',
-                attn_implementation='sdpa',
-                local_files_only=True,
-                low_cpu_mem_usage=True,
-            )
-            # 第 2 步：自动推断设备映射，将部分层分配到 GPU
-            if torch.cuda.is_available():
-                free_gpu, total_gpu = torch.cuda.mem_get_info()
-                logger.info(f'GPU 显存: 空闲 {free_gpu/1024**3:.1f}GB / 总计 {total_gpu/1024**3:.1f}GB')
-                device_map = infer_auto_device_map(
-                    _model,
-                    max_memory={0: f'{int(total_gpu*0.85/1024**3)}GiB', 'cpu': '14GiB'},
-                    no_split_module_classes=['Qwen2DecoderLayer'],
-                )
-                dispatch_model(_model, device_map=device_map)
-                gpu_modules = sum(1 for v in device_map.values() if v == 0)
-                cpu_modules = sum(1 for v in device_map.values() if v == 'cpu')
-                logger.info(
-                    f'模型已分配到 GPU ({gpu_modules} 模块) + CPU ({cpu_modules} 模块)，'
-                    f'显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB'
-                )
-            logger.info(f'模型加载完成，Attention 实现: {_model.config._attn_implementation}')
+            raise
         except Exception as e:
             logger.error(f'模型加载失败: {e}', exc_info=True)
             raise
@@ -95,16 +140,11 @@ def load_model():
     return _model, _tokenizer
 
 
-def is_model_loaded() -> bool:
-    """检查模型是否已加载"""
+def is_model_loaded():
     return _model is not None
 
 
 def chat_with_liuying_stream(messages: list, **overrides):
-    """流式生成回复，返回文本生成器
-
-    overrides 可覆盖默认生成参数：temperature, top_p, max_new_tokens, repetition_penalty
-    """
     model, tokenizer = load_model()
 
     start_time = time.time()
@@ -112,7 +152,6 @@ def chat_with_liuying_stream(messages: list, **overrides):
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors='pt')
-        # 把 inputs 放到模型所在的设备上
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         generation_kwargs = {
             'input_ids': inputs['input_ids'],
