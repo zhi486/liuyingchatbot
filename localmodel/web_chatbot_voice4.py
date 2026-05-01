@@ -1,11 +1,22 @@
 """流萤聊天机器人 — 主入口"""
 import os
+import sys
 
-# 必须在任何库导入前设置，防止 Anaconda 与 PyTorch 的 OpenMP DLL 冲突
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+# === 环境修正（必须在任何库导入前执行）===
+
+# 1. 移除 Anaconda 的 PATH 条目，防止 libiomp5md.dll 冲突。
+#    Anaconda 的 DLL 与 PyTorch 自带的 OpenMP 运行时版本不同，
+#    共存会导致 native 层 segfault (0xC0000005)，进而可能拖垮整个 PyCharm。
+_path = os.environ.get('PATH', '')
+_cleaned = _path.replace('D:\\anaconda3\\Library\\bin;', '') \
+                .replace('D:\\anaconda3\\Library\\bin', '')
+if _cleaned != _path:
+    os.environ['PATH'] = _cleaned
+
+# 2. 允许重复 OpenMP 加载（兜底）
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 import time
-import sys
 import itertools
 from threading import Thread, Event
 

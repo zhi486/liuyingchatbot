@@ -1,5 +1,15 @@
 """Qwen2 模型加载与流式推理"""
 import os
+import sys
+
+# 移除 Anaconda PATH 防止 OpenMP DLL 冲突（兜底）
+_path = os.environ.get('PATH', '')
+_cleaned = _path.replace('D:\\anaconda3\\Library\\bin;', '') \
+                .replace('D:\\anaconda3\\Library\\bin', '')
+if _cleaned != _path:
+    os.environ['PATH'] = _cleaned
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+
 import time
 import torch
 from threading import Thread, Lock
@@ -8,8 +18,6 @@ from transformers import (
     TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList,
 )
 from modules.config import MODEL_PATH, logger
-
-os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 _tokenizer = None
 _model = None
