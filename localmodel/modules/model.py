@@ -1,20 +1,17 @@
 """Qwen2 模型加载与流式推理"""
+import os
 import time
 import torch
 from threading import Thread, Lock
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    AutoModelForCausalLM, AutoTokenizer,
     TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList,
 )
+from accelerate import dispatch_model, infer_auto_device_map
 from modules.config import MODEL_PATH, logger
 
-# 4-bit 量化配置
-quantization_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type='nf4',
-)
+# 防止 OpenMP DLL 冲突导致的崩溃
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 # 模块级变量
 _tokenizer = None
@@ -47,29 +44,49 @@ def is_stop_requested() -> bool:
 
 
 def load_model():
-    """加载模型（线程安全，仅首次调用时执行）"""
+    """加载模型（线程安全，仅首次调用时执行）
+
+    先用 CPU 加载（稳定），再通过 accelerate 手动将部分层分配到 GPU，
+    以绕过 device_map='auto' 和 bitsandbytes 在 Python 3.13 + Windows 上的崩溃问题。
+    """
     global _tokenizer, _model
     if _model is not None:
         return _model, _tokenizer
 
     with _load_lock:
-        # 二次检查：拿到锁后可能已被其他线程加载
         if _model is not None:
             return _model, _tokenizer
 
         logger.info('正在加载模型，请稍候...')
         try:
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
+            _tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_PATH, trust_remote_code=True, local_files_only=True,
+            )
+            # 第 1 步：在 CPU 上加载（不使用 device_map='auto'，避免加速器崩溃）
             _model = AutoModelForCausalLM.from_pretrained(
                 MODEL_PATH,
                 trust_remote_code=True,
-                device_map='auto',
-                quantization_config=quantization_config,
+                device_map='cpu',
                 attn_implementation='sdpa',
                 local_files_only=True,
-                torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
             )
+            # 第 2 步：自动推断设备映射，将部分层分配到 GPU
+            if torch.cuda.is_available():
+                free_gpu, total_gpu = torch.cuda.mem_get_info()
+                logger.info(f'GPU 显存: 空闲 {free_gpu/1024**3:.1f}GB / 总计 {total_gpu/1024**3:.1f}GB')
+                device_map = infer_auto_device_map(
+                    _model,
+                    max_memory={0: f'{int(total_gpu*0.85/1024**3)}GiB', 'cpu': '14GiB'},
+                    no_split_module_classes=['Qwen2DecoderLayer'],
+                )
+                dispatch_model(_model, device_map=device_map)
+                gpu_modules = sum(1 for v in device_map.values() if v == 0)
+                cpu_modules = sum(1 for v in device_map.values() if v == 'cpu')
+                logger.info(
+                    f'模型已分配到 GPU ({gpu_modules} 模块) + CPU ({cpu_modules} 模块)，'
+                    f'显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB'
+                )
             logger.info(f'模型加载完成，Attention 实现: {_model.config._attn_implementation}')
         except Exception as e:
             logger.error(f'模型加载失败: {e}', exc_info=True)
@@ -94,10 +111,12 @@ def chat_with_liuying_stream(messages: list, **overrides):
     logger.info('开始生成模型回复...')
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(prompt, return_tensors='pt').to(model.device)
+        inputs = tokenizer(prompt, return_tensors='pt')
+        # 把 inputs 放到模型所在的设备上
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
         generation_kwargs = {
-            'input_ids': inputs.input_ids,
-            'attention_mask': inputs.attention_mask,
+            'input_ids': inputs['input_ids'],
+            'attention_mask': inputs['attention_mask'],
             'max_new_tokens': overrides.get('max_new_tokens', 300),
             'temperature': overrides.get('temperature', 0.6),
             'top_p': overrides.get('top_p', 0.9),

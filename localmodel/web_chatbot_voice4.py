@@ -1,4 +1,9 @@
 """流萤聊天机器人 — 主入口"""
+import os
+
+# 必须在任何库导入前设置，防止 Anaconda 与 PyTorch 的 OpenMP DLL 冲突
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import time
 import sys
 import itertools
