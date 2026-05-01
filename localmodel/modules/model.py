@@ -19,6 +19,13 @@ from transformers import (
 )
 from modules.config import MODEL_PATH, logger
 
+# flash-attn 可选安装，检测后决定 attention 实现
+try:
+    import flash_attn  # noqa: F401
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
 _tokenizer = None
 _model = None
 _load_lock = Lock()
@@ -46,56 +53,70 @@ def is_stop_requested():
 
 
 def _load_4bit_quantized():
-    """4-bit 量化加载到 GPU（需要 ~4.5GB 空闲显存）"""
+    """4-bit 量化 — 全部尽可能放到 GPU"""
     global _tokenizer, _model, _using_quantization
     _tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH, trust_remote_code=True, local_files_only=True,
     )
-    quant = BitsAndBytesConfig(load_in_4bit=True)
+    quant = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type='nf4',
+    )
+    attn = 'flash_attention_2' if (_HAS_FLASH_ATTN and torch.cuda.is_available()) else 'sdpa'
     _model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         trust_remote_code=True,
         device_map='auto',
         quantization_config=quant,
-        attn_implementation='sdpa',
+        torch_dtype=torch.float16,
+        attn_implementation=attn,
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
     _using_quantization = True
-    logger.info(f'4-bit 量化加载成功，显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB')
+    logger.info(f'4-bit 量化加载成功，显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB，Attention: {attn}')
 
 
 def _load_hybrid():
-    """bfloat16 CPU 加载 + 将部分层分配到 GPU"""
+    """GPU 为主 + CPU 为辅：自动分配层，优先使用 GPU 显存"""
     global _tokenizer, _model, _using_quantization
     _tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH, trust_remote_code=True, local_files_only=True,
     )
+
+    free_gpu, total_gpu = 0, 0
+    if torch.cuda.is_available():
+        free_gpu, total_gpu = torch.cuda.mem_get_info()
+
+    # 自动选择 attention 实现：flash_attention_2 最快（需安装 flash-attn）
+    attn = 'flash_attention_2' if (_HAS_FLASH_ATTN and torch.cuda.is_available()) else 'sdpa'
+
+    # 用 max_memory 引导：GPU 放得下多少就放多少，超额部分自动溢出到 CPU
+    max_memory = None
+    if torch.cuda.is_available() and free_gpu > 1 * 1024**3:
+        gpu_limit = int(min(free_gpu * 0.9, total_gpu * 0.85) / 1024**3)
+        max_memory = {0: f'{max(gpu_limit, 1)}GiB', 'cpu': '32GiB'}
+
     _model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         trust_remote_code=True,
-        device_map='cpu',
-        attn_implementation='sdpa',
+        device_map='auto' if max_memory else 'cpu',
+        max_memory=max_memory,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        attn_implementation=attn,
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
     _using_quantization = False
-    if torch.cuda.is_available() and torch.cuda.mem_get_info()[0] > 2 * 1024**3:
-        from accelerate import dispatch_model, infer_auto_device_map
-        free_gpu, total_gpu = torch.cuda.mem_get_info()
-        try:
-            device_map = infer_auto_device_map(
-                _model,
-                max_memory={0: f'{int(min(free_gpu * 0.9, total_gpu * 0.85)/1024**3)}GiB',
-                            'cpu': '14GiB'},
-                no_split_module_classes=['Qwen2DecoderLayer'],
-            )
-            dispatch_model(_model, device_map=device_map)
-            gpu_n = sum(1 for v in device_map.values() if v == 0)
-            cpu_n = sum(1 for v in device_map.values() if v == 'cpu')
-            logger.info(f'模型分配: GPU {gpu_n} 模块 ({torch.cuda.memory_allocated()/1024**3:.1f}GB) + CPU {cpu_n} 模块')
-        except Exception as e:
-            logger.warning(f'GPU 分配失败，留在 CPU: {e}')
+
+    if _model.device.type == 'cuda':
+        logger.info(f'模型在 GPU 上运行，显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB')
+    else:
+        gpu_layers = sum(1 for p in _model.parameters() if p.device.type == 'cuda')
+        total_layers = sum(1 for _ in _model.parameters())
+        logger.info(f'模型分布在 CPU+GPU，GPU 层: {gpu_layers}/{total_layers}')
 
 
 def load_model():
@@ -110,25 +131,22 @@ def load_model():
         logger.info('正在加载模型，请稍候...')
         torch.cuda.empty_cache()
 
-        # 策略 1：4-bit 量化（最快，需要 ~4.5GB 空闲显存）
+        # 策略 1：4-bit 量化（优先 GPU，自动 CPU offload）
         if torch.cuda.is_available():
             free_gpu = torch.cuda.mem_get_info()[0]
             total_gpu = torch.cuda.get_device_properties(0).total_memory
             logger.info(f'GPU 空闲显存: {free_gpu/1024**3:.1f}GB / {total_gpu/1024**3:.1f}GB')
-            if free_gpu > 4.5 * 1024**3:
-                try:
-                    _load_4bit_quantized()
-                    logger.info(f'加载完成, Attention: {_model.config._attn_implementation}')
-                    return _model, _tokenizer
-                except Exception as e:
-                    logger.warning(f'4-bit 量化失败: {e}，回退中...')
-                    _tokenizer = None
-                    _model = None
-                    torch.cuda.empty_cache()
-            else:
-                logger.info(f'显存不足需 4.5GB 实际仅 {free_gpu/1024**3:.1f}GB，跳过量化')
+            try:
+                _load_4bit_quantized()
+                logger.info(f'加载完成, Attention: {_model.config._attn_implementation}')
+                return _model, _tokenizer
+            except Exception as e:
+                logger.warning(f'4-bit 加载失败: {e}，回退到 bfloat16 混合模式...')
+                _tokenizer = None
+                _model = None
+                torch.cuda.empty_cache()
 
-        # 策略 2：bfloat16 CPU + 部分 GPU offload
+        # 策略 2：bfloat16 — GPU 为主 + CPU 为辅
         try:
             _load_hybrid()
             logger.info(f'加载完成, Attention: {_model.config._attn_implementation}')
@@ -152,24 +170,50 @@ def is_model_loaded():
     return _model is not None
 
 
+# 保留的最大历史轮数（超过则截断最早的，保留最近 N 轮）
+_MAX_HISTORY_TURNS = 8
+
+
+def _truncate_history(messages: list) -> list:
+    """截断对话历史，只保留最近 _MAX_HISTORY_TURNS 轮 + system prompt"""
+    system_idx = None
+    for i, m in enumerate(messages):
+        if m.get('role') == 'system':
+            system_idx = i
+            break
+    conversation = messages[system_idx + 1:] if system_idx is not None else messages
+    if len(conversation) <= _MAX_HISTORY_TURNS * 2:
+        return messages
+    # 保留 system + 最近 N 轮
+    kept = conversation[-(_MAX_HISTORY_TURNS * 2):]
+    if system_idx is not None:
+        kept = [messages[system_idx]] + kept
+    logger.info(f'历史截断: {len(messages)} 条 -> {len(kept)} 条（保留最近 {_MAX_HISTORY_TURNS} 轮）')
+    return kept
+
+
 def chat_with_liuying_stream(messages: list, **overrides):
     model, tokenizer = load_model()
 
     start_time = time.time()
+    # 截断历史，防止 prompt 过长拖慢推理
+    messages = _truncate_history(messages)
     logger.info('开始生成模型回复...')
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors='pt')
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        max_new_tokens = overrides.get('max_new_tokens', 128)
         generation_kwargs = {
             'input_ids': inputs['input_ids'],
             'attention_mask': inputs['attention_mask'],
-            'max_new_tokens': overrides.get('max_new_tokens', 300),
+            'max_new_tokens': max_new_tokens,
             'temperature': overrides.get('temperature', 0.6),
             'top_p': overrides.get('top_p', 0.9),
             'do_sample': True,
             'repetition_penalty': overrides.get('repetition_penalty', 1.1),
             'pad_token_id': tokenizer.eos_token_id,
+            'use_cache': True,
             'stopping_criteria': StoppingCriteriaList([_StopOnFlag()]),
         }
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
@@ -182,6 +226,8 @@ def chat_with_liuying_stream(messages: list, **overrides):
             yield text
         elapsed = time.time() - start_time
         logger.info(f'模型生成完成，耗时 {elapsed:.2f} 秒，回复长度 {len(full_text)} 字符')
+        if max_new_tokens <= 128 and len(full_text) >= max_new_tokens * 0.9:
+            logger.warning(f'回复可能被截断（{len(full_text)} 字符接近上限 {max_new_tokens}），建议增大"最大生成长度"滑块')
     except Exception as e:
         logger.error(f'模型生成异常: {e}', exc_info=True)
         yield '抱歉，我遇到了一些问题……可以再试一次吗？'
