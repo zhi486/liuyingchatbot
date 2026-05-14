@@ -19,6 +19,7 @@ venv/
 
 # 模型文件（太大，不上传）
 localmodel/models/
+models/
 *.bin
 *.safetensors
 
@@ -26,6 +27,8 @@ localmodel/models/
 localmodel/histories/
 localmodel/voices/
 localmodel/exports/
+histories/
+voices/
 *.mp3
 *.wav
 *.log
@@ -35,3 +38,21 @@ localmodel/exports/
 
 # Claude Code 配置
 .claude/
+
+# 临时文件
+temp/
+
+# 测试脚本
+*_test.py
+voice_shift.py
+chatbot_gpu.py
+test/test_fish_audio.py
+test/test_model.py
+test/test_proxy.py
+
+# 旧版本
+web_chatbot.py
+web_chatbot_voice.py
+web_chatbot_voice1.py
+web_chatbot_voice2.py
+web_chatbot_voice3.py
