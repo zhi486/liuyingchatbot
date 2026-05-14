@@ -14,12 +14,18 @@ TTS_HEADERS = {
     'Authorization': f'Bearer {FISH_API_KEY}',
     'Content-Type': 'application/json',
 }
-TTS_PROXIES = {'http': PROXY_URL, 'https': PROXY_URL}
-MAX_RETRIES = 2
+MAX_RETRIES = 3
+
+
+def _get_proxies():
+    """返回代理配置，未设置 PROXY_URL 时返回 None（直连）"""
+    if PROXY_URL:
+        return {'http': PROXY_URL, 'https': PROXY_URL}
+    return None
 
 
 def text_to_speech(text: str) -> str | None:
-    """文本转语音，带缓存和重试"""
+    """文本转语音，带缓存和重试，代理失败自动回退直连"""
     if text in _audio_cache:
         cached_path = _audio_cache[text]
         if os.path.exists(cached_path):
@@ -31,9 +37,13 @@ def text_to_speech(text: str) -> str | None:
     logger.info(f'开始语音合成: {text[:30]}...')
     payload = {'text': text, 'reference_id': LIUYING_REFERENCE_ID, 'format': 'mp3'}
 
+    use_proxy = PROXY_URL is not None
+
     for attempt in range(MAX_RETRIES):
+        proxies = _get_proxies() if use_proxy else None
         try:
-            resp = requests.post(TTS_URL, headers=TTS_HEADERS, json=payload, proxies=TTS_PROXIES, timeout=15)
+            resp = requests.post(TTS_URL, headers=TTS_HEADERS, json=payload,
+                                 proxies=proxies, timeout=15)
             if resp.status_code == 200:
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as f:
                     f.write(resp.content)
@@ -45,6 +55,9 @@ def text_to_speech(text: str) -> str | None:
                 logger.warning(f'Fish Audio 请求失败 ({resp.status_code})，尝试 {attempt+1}/{MAX_RETRIES}')
         except Exception as e:
             logger.warning(f'Fish Audio 异常，尝试 {attempt+1}/{MAX_RETRIES}: {e}')
+            if use_proxy:
+                logger.info('代理连接失败，回退到直连重试')
+                use_proxy = False
             if attempt == MAX_RETRIES - 1:
                 logger.error(f'语音合成最终失败: {e}', exc_info=True)
                 return None

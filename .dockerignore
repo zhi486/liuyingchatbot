@@ -1,0 +1,32 @@
+# 虚拟环境 (Docker 中重新安装)
+.venv/
+env/
+venv/
+
+# Git
+.git/
+
+# IDE
+.idea/
+.vscode/
+
+# 模型文件 (通过 volume 挂载)
+localmodel/models/
+
+# 运行时数据
+localmodel/histories/
+localmodel/voices/
+localmodel/exports/
+*.mp3
+*.wav
+*.log
+
+# 环境变量 (通过 docker-compose 传递)
+.env
+.env.local
+
+# 备份/缓存
+*.bak
+__pycache__/
+.claude/
+_scan*.ps1

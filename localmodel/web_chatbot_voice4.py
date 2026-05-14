@@ -4,21 +4,20 @@ import sys
 
 # === 环境修正（必须在任何库导入前执行）===
 
-# 1. 移除 Anaconda 的 PATH 条目，防止 libiomp5md.dll 冲突。
-#    Anaconda 的 DLL 与 PyTorch 自带的 OpenMP 运行时版本不同，
-#    共存会导致 native 层 segfault (0xC0000005)，进而可能拖垮整个 PyCharm。
+# 1. 移除所有 Anaconda 的 PATH 条目，防止 libiomp5md.dll 冲突。
+#    从 PATH 中用 ; 分割条目，移除所有包含 "anaconda" 的路径。
+#    比单一 replace 更可靠，不会因路径格式差异而失效。
 _path = os.environ.get('PATH', '')
-_cleaned = _path.replace('D:\\anaconda3\\Library\\bin;', '') \
-                .replace('D:\\anaconda3\\Library\\bin', '')
-if _cleaned != _path:
-    os.environ['PATH'] = _cleaned
+_entries = _path.split(';')
+_cleaned_entries = [e for e in _entries if 'anaconda' not in e.lower()]
+if len(_cleaned_entries) != len(_entries):
+    os.environ['PATH'] = ';'.join(_cleaned_entries)
 
 # 2. 允许重复 OpenMP 加载（兜底）
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 import time
-import itertools
-from threading import Thread, Event
+from threading import Thread
 
 import gradio as gr
 
@@ -31,7 +30,10 @@ from modules import (
     load_history, save_history, delete_history, refresh_history_list, export_history,
     cleanup_old_histories,
     custom_css,
+    handle_memo_intent, add_memo_ui, render_memo_cards,
+    build_memo_choices, memo_action,
 )
+
 
 # ================== 角色设定 ==================
 SYSTEM_PROMPT = """你扮演的是《崩坏：星穹铁道》中的角色——**流萤**（Firefly）。此刻你正和开拓者一起度过一段难得的闲暇时光，暂时不需要执行任何任务。你希望像普通青春期女孩一样，与对方分享生活中的点滴，感受平凡而美好的幸福。
@@ -105,6 +107,14 @@ def respond(message, history, temperature, top_p, max_new_tokens, status_text):
     clear_stop_flag()
     start_time = time.time()
     logger.info(f"收到用户消息: {message[:50]}...")
+
+    # 备忘录意图优先（自然语言 CRUD，不依赖模型）
+    memo_reply = handle_memo_intent(message)
+    if memo_reply is not None:
+        new_history = history + [{"role": "user", "content": message},
+                                 {"role": "assistant", "content": memo_reply}]
+        yield new_history, new_history, "备忘录操作完成"  # CSS class handled by Gradio
+        return
 
     # 天气查询优先（不需要模型）
     match = WEATHER_PATTERN.search(message)
@@ -197,81 +207,205 @@ def set_voice_text(audio_file, history_state):
 
 def clear():
     logger.info("清空对话")
-    return [], [], "对话已清空"
+    welcome = [{"role": "assistant", "content": "🦋 嗨，我是流萤……今天天气真好呢。想聊聊天吗？或者用语音跟我说说话吧。"}]
+    return [], welcome, "对话已清空"
+
+
+# ================== 备忘录 UI 辅助 ==================
+def _refresh_memo_ui(status_filter_val):
+    """刷新备忘录面板"""
+    return (
+        render_memo_cards(status_filter_val),
+        build_memo_choices(status_filter_val),
+        "",
+    )
 
 
 # ================== Gradio 界面 ==================
 with gr.Blocks(title="流萤 · 星穹铁道") as demo:
-
-    with gr.Row():
-        with gr.Column(scale=1, min_width=200):
-            gr.HTML(f"""
-            <div class="sidebar">
-                <div class="avatar">
-                    <div class="glow"></div>
-                    <img src="{avatar_img}" alt="流萤头像">
-                </div>
-                <div class="intro">流萤</div>
-                <div class="subtitle">星核猎手 · 萨姆驾驶员</div>
-                <div class="status-bar">
-                    <span class="dot"></span>
-                    在线 · 与你一起的悠闲时光
-                </div>
-                <div class="desc">
-                    喜欢橡木蛋糕卷，对世界充满好奇。<br>
-                    今天，想和你一起度过平凡的幸福。
-                </div>
-                <hr class="divider">
-                <div class="footer-text">✦ 来自《崩坏：星穹铁道》 ✦</div>
-            </div>
-            """)
-            gr.HTML('<div class="dark-toggle"><button onclick="document.querySelector(\'.gradio-container\').classList.toggle(\'dark-mode\')">🌙 暗色模式</button></div>')
-            with gr.Accordion("⚙️ 生成参数", open=False):
-                temperature = gr.Slider(0.1, 2.0, value=0.6, step=0.05, label="温度 (temperature)")
-                top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p")
-                max_new_tokens = gr.Slider(64, 1024, value=300, step=16, label="最大生成长度")
-            with gr.Group(elem_classes="history-section"):
-                gr.Markdown("### 📜 历史对话")
-                history_dropdown = gr.Dropdown(
-                    label="选择历史记录",
-                    choices=[],
-                    interactive=True,
-                )
-                with gr.Row():
-                    load_btn = gr.Button("加载对话", size="sm")
-                    delete_btn = gr.Button("🗑️ 删除", size="sm", elem_classes="delete-btn")
-                    refresh_btn = gr.Button("刷新列表", size="sm")
-                history_status = gr.Textbox(label="", interactive=False, visible=False)
-
-        with gr.Column(scale=3):
-            gr.Markdown("""
-            <div class="title-section">
-                <div class="stars">✦ ✦ ✦</div>
-                <h1>✨ 流萤 ✨</h1>
-                <p>与流萤一起度过悠闲时光，今天想聊些什么呢？</p>
-            </div>
-            """)
-            state = gr.State([])
-            pending_msg = gr.State("")
-            chatbot = gr.Chatbot(label="对话记录", elem_classes="chatbot", render_markdown=True)
+    with gr.Tabs():
+        # ── Tab 1: 对话 ──
+        with gr.TabItem("💬 对话"):
             with gr.Row():
-                msg = gr.Textbox(label="输入你的消息", placeholder="对流萤说点什么吧...", scale=8)
-                audio_input = gr.Audio(sources=["microphone"], type="filepath", label="🎤 语音输入", scale=1)
-                send_btn = gr.Button("发送", variant="primary", scale=1)
-            with gr.Row():
-                selected_text = gr.Textbox(label="点击助手消息自动填充", scale=5, interactive=True)
-                gen_voice_btn = gr.Button("🔊 生成语音", variant="secondary", scale=1)
-                save_voice_btn = gr.Button("💾 保存语音", variant="secondary", scale=1)
-                stop_btn = gr.Button("⏹️ 停止", variant="stop", scale=1)
-            with gr.Row():
-                save_btn = gr.Button("💾 保存当前对话", elem_classes="secondary")
-                export_btn = gr.Button("📥 导出为 Markdown", elem_classes="secondary")
-                clear_btn = gr.Button("🗑️ 清空对话", elem_classes="secondary")
-                status = gr.Textbox(label="状态", interactive=False, value="就绪", elem_classes="status")
-            audio_output = gr.Audio(visible=True, autoplay=True, elem_classes="audio-hidden")
-            export_download = gr.File(label="下载导出的文件", visible=False)
+                with gr.Column(scale=1, min_width=200):
+                    gr.HTML(f"""
+                    <div class="sidebar">
+                        <div class="avatar">
+                            <div class="glow"></div>
+                            <img src="{avatar_img}" alt="流萤头像">
+                        </div>
+                        <div class="intro">流萤</div>
+                        <div class="subtitle">星核猎手 · 萨姆驾驶员</div>
+                        <div class="status-bar">
+                            <span class="dot"></span>
+                            在线 · 与你一起的悠闲时光
+                        </div>
+                        <div class="desc">
+                            喜欢橡木蛋糕卷，对世界充满好奇。<br>
+                            今天，想和你一起度过平凡的幸福。
+                        </div>
+                        <hr class="divider">
+                        <div class="footer-text">✦ 来自《崩坏：星穹铁道》 ✦</div>
+                    </div>
+                    """)
+                    gr.HTML("""
+                    <div class="dark-toggle">
+                        <button id="dark-mode-toggle" onclick="
+                            const c = document.querySelector('.gradio-container');
+                            const isDark = c.classList.toggle('dark-mode');
+                            localStorage.setItem('chatbot-dark-mode', isDark ? '1' : '0');
+                            this.textContent = isDark ? '☀️ 亮色模式' : '🌙 暗色模式';
+                        ">🌙 暗色模式</button>
+                    </div>
+                    <div id="loading-overlay" class="loading-overlay">
+                        <div class="loading-spinner"></div>
+                        <div class="loading-text">流萤正在醒来……</div>
+                    </div>
+                    <div id="toast-container" class="toast-container"></div>
+                    <script>
+                    (function() {
+                        // Dark mode persistence
+                        if (localStorage.getItem('chatbot-dark-mode') === '1') {
+                            document.querySelector('.gradio-container').classList.add('dark-mode');
+                            var btn = document.getElementById('dark-mode-toggle');
+                            if (btn) btn.textContent = '☀️ 亮色模式';
+                        }
+                    })();
+                    // Toast helper
+                    function showToast(msg, type) {
+                        var c = document.getElementById('toast-container');
+                        if (!c) return;
+                        var t = document.createElement('div');
+                        t.className = 'toast ' + (type || 'info');
+                        t.textContent = msg;
+                        c.appendChild(t);
+                        setTimeout(function() { if (t.parentNode) t.remove(); }, 3000);
+                    }
+                    </script>
+                    """)
+                    with gr.Accordion("⚙️ 生成参数", open=False):
+                        temperature = gr.Slider(0.1, 2.0, value=0.6, step=0.05, label="温度 (temperature)")
+                        top_p = gr.Slider(0.1, 1.0, value=0.9, step=0.05, label="Top-p")
+                        max_new_tokens = gr.Slider(64, 1024, value=300, step=16, label="最大生成长度")
+                    with gr.Group(elem_classes="history-section"):
+                        gr.Markdown("### 📜 历史对话")
+                        history_dropdown = gr.Dropdown(
+                            label="选择历史记录",
+                            choices=[],
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            load_btn = gr.Button("加载对话", size="sm")
+                            delete_btn = gr.Button("🗑️ 删除", size="sm", elem_classes="delete-btn")
+                            refresh_btn = gr.Button("刷新列表", size="sm")
+                        history_status = gr.Textbox(label="", interactive=False, visible=False)
 
-    # ================== 事件绑定 ==================
+                with gr.Column(scale=3):
+                    gr.Markdown("""
+                    <div class="title-section">
+                        <div class="stars">✦ ✦ ✦</div>
+                        <h1>✨ 流萤 ✨</h1>
+                        <p>与流萤一起度过悠闲时光，今天想聊些什么呢？</p>
+                    </div>
+                    """)
+                    state = gr.State([])
+                    pending_msg = gr.State("")
+                    chatbot = gr.Chatbot(
+                        label="对话记录",
+                        elem_classes="chatbot",
+                        render_markdown=True,
+                        value=[{"role": "assistant", "content": "🦋 嗨，我是流萤……今天天气真好呢。想聊聊天吗？或者用语音跟我说说话吧。"}],
+                    )
+                    gr.HTML("""
+                    <div id="typing-dots" class="typing-indicator" style="display:none">
+                        <span class="typing-dot"></span>
+                        <span class="typing-dot"></span>
+                        <span class="typing-dot"></span>
+                    </div>
+                    <script>
+                    (function() {
+                        var typingObs = new MutationObserver(function() {
+                            var el = document.querySelector('.status textarea, .status input');
+                            var dots = document.getElementById('typing-dots');
+                            if (!dots) return;
+                            var v = (el && el.value) || '';
+                            dots.style.display = v.includes('生成') ? 'flex' : 'none';
+                        });
+                        var s = document.querySelector('.status');
+                        if (s) typingObs.observe(s, { subtree: true, characterData: true, childList: true });
+                    })();
+                    </script>
+                    """)
+                    with gr.Row():
+                        msg = gr.Textbox(label="输入你的消息", placeholder="对流萤说点什么吧...", scale=8)
+                        audio_input = gr.Audio(sources=["microphone"], type="filepath", label="🎤 语音输入", scale=1)
+                        send_btn = gr.Button("发送", variant="primary", scale=1)
+                    with gr.Row():
+                        selected_text = gr.Textbox(label="点击助手消息自动填充", scale=5, interactive=True)
+                        gen_voice_btn = gr.Button("🔊 生成语音", variant="secondary", scale=1)
+                        save_voice_btn = gr.Button("💾 保存语音", variant="secondary", scale=1)
+                        stop_btn = gr.Button("⏹️ 停止", variant="stop", scale=1)
+                    with gr.Row():
+                        save_btn = gr.Button("💾 保存当前对话", elem_classes="secondary")
+                        export_btn = gr.Button("📥 导出为 Markdown", elem_classes="secondary")
+                        clear_btn = gr.Button("🗑️ 清空对话", elem_classes="secondary")
+                        status = gr.Textbox(label="状态", interactive=False, value="就绪", elem_classes="status")
+                    audio_output = gr.Audio(visible=True, autoplay=True, elem_classes="audio-hidden")
+                    export_download = gr.File(label="下载导出的文件", visible=False)
+
+        # ── Tab 2: 备忘录 ──
+        with gr.TabItem("📋 备忘录"):
+            gr.Markdown("### 📋 备忘录管理")
+            with gr.Row():
+                # 左侧：添加表单
+                with gr.Column(scale=1):
+                    gr.Markdown("#### ✏️ 添加备忘录")
+                    memo_content = gr.Textbox(
+                        label="内容",
+                        placeholder="输入备忘录内容...",
+                    )
+                    with gr.Row():
+                        memo_date = gr.Textbox(
+                            label="日期 (YYYY-MM-DD)",
+                            placeholder="2026-05-13",
+                            scale=1,
+                        )
+                        memo_time = gr.Textbox(
+                            label="时间 (HH:MM)",
+                            placeholder="12:00",
+                            scale=1,
+                        )
+                    memo_priority = gr.Radio(
+                        choices=[("高优先级", "high"), ("中优先级", "medium"), ("低优先级", "low")],
+                        value="medium",
+                        label="优先级",
+                    )
+                    memo_add_btn = gr.Button("➕ 添加备忘录", variant="primary")
+                    memo_status_msg = gr.Textbox(label="操作结果", interactive=False)
+
+                # 右侧：备忘录列表
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        memo_status_filter = gr.Radio(
+                            choices=[("待办", "pending"), ("已完成", "done"), ("全部", "all")],
+                            value="pending",
+                            label="筛选状态",
+                        )
+                        memo_refresh_btn = gr.Button("🔄 刷新", size="sm")
+
+                    memo_cards = gr.HTML(render_memo_cards("pending"))
+
+                    memo_selector = gr.Radio(
+                        label="选择要操作的备忘录",
+                        choices=build_memo_choices("pending"),
+                        interactive=True,
+                        elem_classes="memo-radio-group",
+                    )
+                    with gr.Row():
+                        memo_toggle_btn = gr.Button("✅ 切换完成", size="sm", scale=1)
+                        memo_delete_btn = gr.Button("🗑️ 删除", size="sm", scale=1)
+
+    # ================== 对话事件绑定 ==================
     def capture(m):
         return m
 
@@ -314,36 +448,64 @@ with gr.Blocks(title="流萤 · 星穹铁道") as demo:
     refresh_btn.click(refresh_history_list, None, history_dropdown)
 
     demo.load(refresh_history_list, None, history_dropdown)
+    demo.load(None, None, None, js="""
+    function() {
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {
+            overlay.classList.add('hidden');
+            setTimeout(function() { if (overlay.parentNode) overlay.remove(); }, 500);
+        }
+    }
+    """)
 
     gen_voice_btn.click(generate_voice_from_text, [selected_text], [audio_output, status])
     save_voice_btn.click(save_voice_from_text, [selected_text], [audio_output, status])
 
     chatbot.select(on_chat_select, [state], selected_text)
 
+    # ================== 备忘录事件绑定 ==================
+    memo_status_filter.change(
+        _refresh_memo_ui, [memo_status_filter], [memo_cards, memo_selector, memo_status_msg]
+    )
 
-# ================== 加载动画 ==================
-def _spinner(stop_event: Event):
-    """终端旋转加载动画"""
-    for char in itertools.cycle('⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'):
-        if stop_event.is_set():
-            break
-        sys.stdout.write(f'\r{char} 正在加载模型 (Qwen2-7B-Instruct)，首次约1-3分钟...')
-        sys.stdout.flush()
-        time.sleep(0.12)
-    sys.stdout.write('\r✓ 模型加载完成！' + ' ' * 50 + '\n')
+    memo_refresh_btn.click(
+        _refresh_memo_ui, [memo_status_filter], [memo_cards, memo_selector, memo_status_msg]
+    )
+
+    memo_add_btn.click(
+        add_memo_ui,
+        [memo_content, memo_date, memo_time, memo_priority],
+        [memo_cards, memo_status_msg],
+    ).then(
+        lambda f: build_memo_choices(f),
+        [memo_status_filter],
+        [memo_selector],
+    ).then(
+        lambda: "", None, memo_content
+    ).then(
+        lambda: "", None, memo_date
+    ).then(
+        lambda: "", None, memo_time
+    )
+
+    memo_toggle_btn.click(
+        lambda a, s: memo_action("toggle", a, s),
+        [memo_selector, memo_status_filter],
+        [memo_cards, memo_status_msg, memo_selector],
+    )
+
+    memo_delete_btn.click(
+        lambda a, s: memo_action("delete", a, s),
+        [memo_selector, memo_status_filter],
+        [memo_cards, memo_status_msg, memo_selector],
+    )
 
 
 # ================== 启动 ==================
 validate_config()
 cleanup_old_voices()
 cleanup_old_histories()
-
-# 终端加载动画 + 同步模型加载
-_spinner_event = Event()
-Thread(target=_spinner, args=(_spinner_event,), daemon=True).start()
 load_model()
-_spinner_event.set()
-time.sleep(0.15)  # 让 spinner 完成最后一帧输出
 
 # 后台预加载常用语音
 Thread(target=preload_common_audio, daemon=True).start()

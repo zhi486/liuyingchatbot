@@ -4,11 +4,11 @@ import sys
 
 # 移除 Anaconda PATH 防止 OpenMP DLL 冲突（兜底）
 _path = os.environ.get('PATH', '')
-_cleaned = _path.replace('D:\\anaconda3\\Library\\bin;', '') \
-                .replace('D:\\anaconda3\\Library\\bin', '')
-if _cleaned != _path:
-    os.environ['PATH'] = _cleaned
-os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+_entries = _path.split(';')
+_cleaned_entries = [e for e in _entries if 'anaconda' not in e.lower()]
+if len(_cleaned_entries) != len(_entries):
+    os.environ['PATH'] = ';'.join(_cleaned_entries)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import time
 import torch
@@ -70,10 +70,8 @@ def _load_4bit_quantized():
         trust_remote_code=True,
         device_map='auto',
         quantization_config=quant,
-        torch_dtype=torch.float16,
         attn_implementation=attn,
         local_files_only=True,
-        low_cpu_mem_usage=True,
     )
     _using_quantization = True
     logger.info(f'4-bit 量化加载成功，显存占用 {torch.cuda.memory_allocated()/1024**3:.1f}GB，Attention: {attn}')
@@ -104,10 +102,8 @@ def _load_hybrid():
         trust_remote_code=True,
         device_map='auto' if max_memory else 'cpu',
         max_memory=max_memory,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         attn_implementation=attn,
         local_files_only=True,
-        low_cpu_mem_usage=True,
     )
     _using_quantization = False
 
